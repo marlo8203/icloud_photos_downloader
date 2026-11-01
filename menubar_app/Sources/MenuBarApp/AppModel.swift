@@ -561,16 +561,19 @@ final class AppModel: ObservableObject {
 
         var options = Prefs.scanOptions
         options.maxCandidates = Int.max  // the confirmation limit below decides
-        let found: [TrashCandidate]
+        let scan: ScanResult
         do {
-            found = try await Task.detached { try scanTrashCandidates(options).candidates }.value
+            scan = try await Task.detached { try scanTrashCandidates(options) }.value
         } catch {
             AppLog.write("automatic deletion skipped: \(error.localizedDescription)")
             return
         }
-        // photos that came back from the trash must be handled again if they are deleted later
-        deletedFromICloud.formIntersection(found.map(\.id))
-        let work = found.filter { (wantICloud && !deletedFromICloud.contains($0.id)) || wantDisk }
+        let found = scan.candidates
+        // A photo is forgotten only when it is no longer in Photos' trash (restored or emptied), and not when its
+        // file is gone: icloudpd downloads a file again while its photo is still in iCloud, and handling it
+        // again each time would delete the same file in a loop.
+        deletedFromICloud.formIntersection(scan.trashedKeys)
+        let work = found.filter { !deletedFromICloud.contains($0.id) }
         guard !work.isEmpty else { pendingDeletion = []; return }
 
         if d.bool(forKey: Prefs.confirmLargeDeletes), work.count > d.integer(forKey: Prefs.confirmThreshold) {
@@ -627,14 +630,12 @@ final class AppModel: ObservableObject {
         var summary: [String] = []
 
         if wantICloud {
-            let todo = items.filter { !deletedFromICloud.contains($0.id) }
+            let todo = items
             if !todo.isEmpty {
                 deletionStatus = "Deleting \(todo.count) photo(s) from iCloud…"
                 let result = await Deletion.deleteFromICloud(todo, dryRun: false)
                 AppLog.write("automatic deletion from iCloud \(result.ok ? "done" : "failed"): \(result.output.suffix(300))")
                 if result.ok {
-                    deletedFromICloud.formUnion(todo.map(\.id))
-                    saveDeletedFromICloud()
                     deletionRetries = 0
                     recordEvents(.deletedICloud, todo)
                     summary.append("\(todo.count) deleted from iCloud")
@@ -658,12 +659,13 @@ final class AppModel: ObservableObject {
             }
         }
         if wantDisk {
-            let ready = items.filter { !wantICloud || deletedFromICloud.contains($0.id) }
-            let result = Deletion.moveToTrash(ready)
+            let result = Deletion.moveToTrash(items)  // the iCloud step above returned early when it failed
             AppLog.write("moved \(result.moved) file(s) to the Trash. \(result.failures.joined(separator: "; "))")
             recordEvents(.trashedDisk, result.items)
             if result.moved > 0 { summary.append("\(result.moved) moved to the Trash") }
         }
+        deletedFromICloud.formUnion(items.map(\.id))  // handled: not touched again while it stays in the trash
+        saveDeletedFromICloud()
         pendingDeletion = []
         lastPendingSignature = ""
         if !summary.isEmpty {
