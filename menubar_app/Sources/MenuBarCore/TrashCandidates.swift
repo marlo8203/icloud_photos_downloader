@@ -39,6 +39,8 @@ public struct ScanResult {
     public var candidates: [TrashCandidate] = []
     public var trashedTotal = 0
     public var assetTotal = 0
+    /// NAME|size of every photo in Photos' trash (whether or not a downloaded file matches it)
+    public var trashedKeys: Set<String> = []
     public var stagedFiles = 0
     public var skippedTooRecent = 0
     public var ambiguous = 0
@@ -133,6 +135,7 @@ public func scanTrashCandidates(_ options: ScanOptions, now: Date = Date()) thro
               let cName = sqlite3_column_text(stmt, 0) else { continue }
         let name = String(cString: cName)
         let size = sqlite3_column_int64(stmt, 1)
+        result.trashedKeys.insert("\(name.uppercased())|\(size)")
         let trashed = sqlite3_column_double(stmt, 2) + appleEpoch
         let created = sqlite3_column_double(stmt, 3) + appleEpoch
 

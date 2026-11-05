@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import MenuBarCore
+import Network
 import UserNotifications
 
 @MainActor
@@ -68,7 +69,12 @@ final class AppModel: ObservableObject {
     private var problemCleared = true
     private var lastLogTriggerAt = Date.distantPast
     private var recoveryTask: Task<Void, Never>?
-    private let retryDelays: [UInt64] = [30, 120, 300]
+    private let retryDelays: [UInt64] = [30, 120, 300, 900, 1800]
+
+    // The Mac just woke up and the network is not there yet: the first attempts then fail at once and the
+    // sync would otherwise wait for the next scheduled pass, up to an hour. So the app watches the network.
+    private let pathMonitor = NWPathMonitor()
+    private var networkIsUp = true
 
     init() {
         Prefs.registerDefaults()
@@ -112,6 +118,7 @@ final class AppModel: ObservableObject {
             forName: UserDefaults.didChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in MainActor.assumeIsolated { self?.settingsMayHaveChanged() } }
         startLibraryWatch()
+        startNetworkWatch()
         if UserDefaults.standard.bool(forKey: Prefs.startWatchingAtLaunch) {
             DispatchQueue.main.async { self.startWatching() }
         }
@@ -240,12 +247,8 @@ final class AppModel: ObservableObject {
         launchedArgs = args
         let p = Launcher.makeProcess(args: args)
         let logURL = AppLog.url
-        if !FileManager.default.fileExists(atPath: logURL.path) {
-            FileManager.default.createFile(atPath: logURL.path, contents: nil)
-        }
         AppLog.write("starting sync")
-        if let handle = try? FileHandle(forWritingTo: logURL) {
-            _ = try? handle.seekToEnd()
+        if let handle = AppLog.appendHandle() {  // append mode, so that the app's lines are not overwritten
             p.standardOutput = handle
             p.standardError = handle
         }
@@ -354,6 +357,28 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: - Network
+
+    private func startNetworkWatch() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let up = path.status == .satisfied
+            Task { @MainActor in self?.networkChanged(up: up) }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "photos-sync.network"))
+    }
+
+    private func networkChanged(up: Bool) {
+        let wasUp = networkIsUp
+        networkIsUp = up
+        guard up, !wasUp else { return }
+        AppLog.write("the network is back")
+        // a problem is being shown: try again now instead of waiting for the next attempt
+        guard hasProblem, !stoppedByUser else { return }
+        recoveryTask?.cancel()
+        retries = 0
+        if isRunning { syncNow() } else { startWatching() }
+    }
+
     // MARK: - Automatic recovery
 
     /// icloudpd keeps running after a failed pass ("Error processing user …" and then waits for the
@@ -392,6 +417,12 @@ final class AppModel: ObservableObject {
                 giveUp(failure)
             }
         case .network, .other:
+            if failure.kind == .network, !networkIsUp {
+                // no point in trying: the "the network is back" step above does it as soon as there is one
+                AppLog.write("waiting for the network")
+                set(.recovering)
+                return
+            }
             guard retries < retryDelays.count else { giveUp(failure); return }
             let delay = retryDelays[retries]
             retries += 1
@@ -561,16 +592,19 @@ final class AppModel: ObservableObject {
 
         var options = Prefs.scanOptions
         options.maxCandidates = Int.max  // the confirmation limit below decides
-        let found: [TrashCandidate]
+        let scan: ScanResult
         do {
-            found = try await Task.detached { try scanTrashCandidates(options).candidates }.value
+            scan = try await Task.detached { try scanTrashCandidates(options) }.value
         } catch {
             AppLog.write("automatic deletion skipped: \(error.localizedDescription)")
             return
         }
-        // photos that came back from the trash must be handled again if they are deleted later
-        deletedFromICloud.formIntersection(found.map(\.id))
-        let work = found.filter { (wantICloud && !deletedFromICloud.contains($0.id)) || wantDisk }
+        let found = scan.candidates
+        // A photo is forgotten only when it is no longer in Photos' trash (restored or emptied), and not when its
+        // file is gone: icloudpd downloads a file again while its photo is still in iCloud, and handling it
+        // again each time would delete the same file in a loop.
+        deletedFromICloud.formIntersection(scan.trashedKeys)
+        let work = found.filter { !deletedFromICloud.contains($0.id) }
         guard !work.isEmpty else { pendingDeletion = []; return }
 
         if d.bool(forKey: Prefs.confirmLargeDeletes), work.count > d.integer(forKey: Prefs.confirmThreshold) {
@@ -627,14 +661,12 @@ final class AppModel: ObservableObject {
         var summary: [String] = []
 
         if wantICloud {
-            let todo = items.filter { !deletedFromICloud.contains($0.id) }
+            let todo = items
             if !todo.isEmpty {
                 deletionStatus = "Deleting \(todo.count) photo(s) from iCloud…"
                 let result = await Deletion.deleteFromICloud(todo, dryRun: false)
                 AppLog.write("automatic deletion from iCloud \(result.ok ? "done" : "failed"): \(result.output.suffix(300))")
                 if result.ok {
-                    deletedFromICloud.formUnion(todo.map(\.id))
-                    saveDeletedFromICloud()
                     deletionRetries = 0
                     recordEvents(.deletedICloud, todo)
                     summary.append("\(todo.count) deleted from iCloud")
@@ -658,12 +690,13 @@ final class AppModel: ObservableObject {
             }
         }
         if wantDisk {
-            let ready = items.filter { !wantICloud || deletedFromICloud.contains($0.id) }
-            let result = Deletion.moveToTrash(ready)
+            let result = Deletion.moveToTrash(items)  // the iCloud step above returned early when it failed
             AppLog.write("moved \(result.moved) file(s) to the Trash. \(result.failures.joined(separator: "; "))")
             recordEvents(.trashedDisk, result.items)
             if result.moved > 0 { summary.append("\(result.moved) moved to the Trash") }
         }
+        deletedFromICloud.formUnion(items.map(\.id))  // handled: not touched again while it stays in the trash
+        saveDeletedFromICloud()
         pendingDeletion = []
         lastPendingSignature = ""
         if !summary.isEmpty {
