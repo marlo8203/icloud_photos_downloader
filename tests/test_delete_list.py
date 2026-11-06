@@ -85,13 +85,19 @@ class ReadDeleteListTestCase(TestCase):
         )
         entries = read_delete_list(path)
         self.assertEqual(
-            entries,
-            {
-                ("IMG_1.HEIC", 100): (3, 1700000000.0),
-                ("IMG_2.HEIC", 200): (4, datetime.datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC).timestamp()),
-                ("IMG_3.HEIC", 300): (5, None),
-            },
+            [(e.name, e.size, e.timestamp, e.line) for e in entries],
+            [
+                ("img_1.heic", 100, 1700000000.0, 3),
+                ("IMG_2.HEIC", 200, datetime.datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC).timestamp(), 4),
+                ("IMG_3.HEIC", 300, None, 5),
+            ],
         )
+        self.assertEqual(entries[0].key, "IMG_1.HEIC")
+
+    def test_keeps_lines_with_the_same_name_and_size(self) -> None:
+        # two photos can share name and size; none of the lines may overwrite another
+        entries = read_delete_list(write_list("IMG_1.HEIC\t100\t10\nIMG_1.HEIC\t100\t3000\n"))
+        self.assertEqual([(e.line, e.timestamp) for e in entries], [(1, 10.0), (2, 3000.0)])
 
     def test_rejects_line_without_tab(self) -> None:
         with self.assertRaises(ValueError):
@@ -174,6 +180,43 @@ class DeleteFromListTestCase(TestCase):
         self.run_delete(one, f"IMG_0100.HEIC\t1100\t{unix(100)}\n")
         # the second entry costs far less than the first because positions are remembered
         self.assertLess(library.all.requests, one.all.requests + 6)
+
+    def test_a_different_photo_with_the_same_name_and_size_is_not_deleted(self) -> None:
+        # the photo the line means is gone; the only one left was taken 400 hours later
+        other = FakeAsset("other", "IMG_0001.HEIC", 1001, BASE + datetime.timedelta(hours=400))
+        status, real, dry = self.run_delete(
+            FakeLibrary(FakeAlbum([other])), f"IMG_0001.HEIC\t1001\t{unix(1)}\n"
+        )
+        self.assertEqual(status, 0)
+        real.assert_not_called()
+        dry.assert_not_called()
+
+    def test_dates_tell_photos_with_the_same_name_and_size_apart(self) -> None:
+        first = FakeAsset("first", "IMG_0001.HEIC", 1001, BASE + datetime.timedelta(hours=10))
+        second = FakeAsset("second", "IMG_0001.HEIC", 1001, BASE + datetime.timedelta(hours=300))
+        status, real, _ = self.run_delete(
+            FakeLibrary(FakeAlbum([first, second])),
+            f"IMG_0001.HEIC\t1001\t{unix(10)}\nIMG_0001.HEIC\t1001\t{unix(300)}\n",
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(sorted(c.args[2].id for c in real.call_args_list), ["first", "second"])
+
+    def test_date_has_a_tolerance(self) -> None:
+        near = FakeAsset("near", "IMG_0001.HEIC", 1001, BASE + datetime.timedelta(hours=5, seconds=100))
+        far = FakeAsset("far", "IMG_0002.HEIC", 1002, BASE + datetime.timedelta(hours=6, seconds=300))
+        status, real, _ = self.run_delete(
+            FakeLibrary(FakeAlbum([near, far])),
+            f"IMG_0001.HEIC\t1001\t{unix(5)}\nIMG_0002.HEIC\t1002\t{unix(6)}\n",
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual([c.args[2].id for c in real.call_args_list], ["near"])
+
+    def test_a_repeated_line_deletes_the_photo_once(self) -> None:
+        library = make_library(20)
+        line = f"IMG_0005.HEIC\t1005\t{unix(5)}\n"
+        status, real, _ = self.run_delete(library, line + line)
+        self.assertEqual(status, 0)
+        self.assertEqual(real.call_count, 1)
 
     def test_dry_run_does_not_delete(self) -> None:
         status, real, dry = self.run_delete(

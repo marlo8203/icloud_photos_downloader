@@ -908,13 +908,28 @@ def delete_photo(
 DELETE_LIST_DATE_TOLERANCE_SECONDS = 120
 
 
-def read_delete_list(path: str) -> Dict[Tuple[str, int], Tuple[int, float | None]]:
-    """Parse `FILENAME<TAB>SIZE[<TAB>DATE]` lines into {(NAME_UPPER, size): (line_number, unix_ts)}.
+class DeleteEntry(NamedTuple):
+    """One line of a `--delete-list` file."""
 
-    DATE is a unix timestamp or an ISO 8601 date/time. It is optional, but without it the whole
-    iCloud library has to be scanned to find the asset.
+    name: str
+    size: int
+    timestamp: float | None
+    line: int
+
+    @property
+    def key(self) -> str:
+        return self.name.upper()
+
+
+def read_delete_list(path: str) -> List[DeleteEntry]:
+    """Parse `FILENAME<TAB>SIZE[<TAB>DATE]` lines.
+
+    DATE is a unix timestamp or an ISO 8601 date/time. When it is given, an asset only matches if its own
+    date is within DELETE_LIST_DATE_TOLERANCE_SECONDS of it, and the asset is found without reading the whole
+    library. Without it, the whole library is read and name and size alone decide.
+    Every line is kept: two lines with the same name and size may be two different photos.
     """
-    entries: Dict[Tuple[str, int], Tuple[int, float | None]] = {}
+    entries: List[DeleteEntry] = []
     with open(path, encoding="utf-8") as f:
         for number, line in enumerate(f, start=1):
             line = line.rstrip("\r\n")
@@ -935,8 +950,27 @@ def read_delete_list(path: str) -> Dict[Tuple[str, int], Tuple[int, float | None
                         timestamp = datetime.datetime.fromisoformat(raw_date).timestamp()
                     except ValueError:
                         raise ValueError(f"{path}:{number}: invalid DATE {raw_date!r}") from None
-            entries[(parts[0].strip().upper(), int(parts[1]))] = (number, timestamp)
+            entries.append(DeleteEntry(parts[0].strip(), int(parts[1]), timestamp, number))
     return entries
+
+
+def _asset_names(asset: PhotoAsset) -> set[str]:
+    """The names an asset can have on disk: plain, or with the id suffix of `--file-match-policy name-id7`
+    (files downloaded that way carry the iCloud ID in their name, and so do the photos imported from them)."""
+    plain = asset.filename
+    return {
+        plain.upper(),
+        apply_file_match_policy(FileMatchPolicy.NAME_ID7, asset.id)(plain).upper(),
+    }
+
+
+def _entry_matches(entry: DeleteEntry, asset: PhotoAsset) -> bool:
+    """Name and size must be equal, and so must the date (within the tolerance) when the line has one."""
+    if asset.size != entry.size or entry.key not in _asset_names(asset):
+        return False
+    if entry.timestamp is None:
+        return True
+    return abs(asset.asset_date.timestamp() - entry.timestamp) <= DELETE_LIST_DATE_TOLERANCE_SECONDS
 
 
 def _rank_date(
@@ -1002,33 +1036,28 @@ def delete_from_list(
     dry_run: bool,
     filename_builder: Callable[[PhotoAsset], str],
 ) -> int:
-    """Delete from iCloud the assets listed in a file (matched by original filename and size)."""
-    wanted = read_delete_list(list_path)
-    if len(wanted) == 0:
+    """Delete from iCloud the assets listed in a file (matched by original filename, size and, when given, date)."""
+    entries = read_delete_list(list_path)
+    if len(entries) == 0:
         logger.info("Delete list %s is empty", list_path)
         return 0
-    if len(wanted) > max_entries:
+    if len(entries) > max_entries:
         logger.error(
             "Delete list has %d entries, more than --delete-list-max %d. Refusing to run",
-            len(wanted),
+            len(entries),
             max_entries,
         )
         return 1
 
     album = library_object.all
-    matches: Dict[Tuple[str, int], Dict[str, PhotoAsset]] = {}
+    wanted = {(entry.key, entry.size) for entry in entries}
+    seen: Dict[str, PhotoAsset] = {}  # assets with the name and size of some line, by id
 
     def consider(asset: PhotoAsset) -> None:
-        # files downloaded with --file-match-policy name-id7 carry the iCloud ID in their name, and
-        # so do the photos imported from them, so accept that form as well as the plain name
-        plain = asset.filename
-        names = {plain.upper(), apply_file_match_policy(FileMatchPolicy.NAME_ID7, asset.id)(plain).upper()}
-        for name in names:
-            key = (name, asset.size)
-            if key in wanted:
-                matches.setdefault(key, {})[asset.id] = asset
+        if any((name, asset.size) in wanted for name in _asset_names(asset)):
+            seen[asset.id] = asset
 
-    dated = [(key, entry[1]) for key, entry in wanted.items() if entry[1] is not None]
+    dated = [entry for entry in entries if entry.timestamp is not None]
     if dated:
         # Deleted photos are usually among the newest, so one request for the first page (the newest
         # ~100 assets) answers most lists. Only entries older than that page need the binary search.
@@ -1043,15 +1072,15 @@ def delete_from_list(
         tolerance = DELETE_LIST_DATE_TOLERANCE_SECONDS
         rank_dates: Dict[int, float | None] = {}
         total: int | None = None
-        for key, timestamp in dated:
-            assert timestamp is not None
-            if oldest_in_head is not None and timestamp - tolerance >= oldest_in_head:
+        for entry in dated:
+            assert entry.timestamp is not None
+            if oldest_in_head is not None and entry.timestamp - tolerance >= oldest_in_head:
                 continue  # everything near this date is in the first page already
             if total is None:
                 total = len(album)
-            for asset in _assets_around(album, total, timestamp, rank_dates, low=len(head)):
+            for asset in _assets_around(album, total, entry.timestamp, rank_dates, low=len(head)):
                 consider(asset)
-    if len(dated) < len(wanted):
+    if len(dated) < len(entries):
         logger.info("Some entries have no date, scanning the whole iCloud library...")
         for scanned, asset in enumerate(album, start=1):
             consider(asset)
@@ -1059,22 +1088,37 @@ def delete_from_list(
                 logger.info("Scanned %d assets...", scanned)
 
     status = 0
-    for key, (line_number, _) in wanted.items():
-        found = list(matches.get(key, {}).values())
+    requested: Dict[str, int] = {}  # asset id -> the line that asked for it
+    for entry in entries:
+        found = [asset for asset in seen.values() if _entry_matches(entry, asset)]
+        described = f"{entry.name} {entry.size}" + (
+            f" taken {datetime.datetime.fromtimestamp(entry.timestamp).isoformat(timespec='seconds')}"
+            if entry.timestamp is not None
+            else ""
+        )
         if len(found) == 1:
+            asset = found[0]
+            if asset.id in requested:
+                logger.warning(
+                    "Line %d is the same photo as line %d, nothing more to do: %s",
+                    entry.line,
+                    requested[asset.id],
+                    described,
+                )
+                continue
+            requested[asset.id] = entry.line
             if dry_run:
-                delete_photo_dry_run(logger, library_object, found[0], filename_builder)
+                delete_photo_dry_run(logger, library_object, asset, filename_builder)
             else:
-                delete_photo(logger, library_object, found[0], filename_builder)
+                delete_photo(logger, library_object, asset, filename_builder)
         elif len(found) == 0:
-            logger.warning("Not found in iCloud (line %d): %s %d", line_number, key[0], key[1])
+            logger.warning("Not found in iCloud (line %d): %s", entry.line, described)
         else:
             logger.warning(
-                "Ambiguous, %d assets in iCloud match (line %d): %s %d. Skipping",
+                "Ambiguous, %d assets in iCloud match (line %d): %s. Skipping",
                 len(found),
-                line_number,
-                key[0],
-                key[1],
+                entry.line,
+                described,
             )
             status = 1
     return status
