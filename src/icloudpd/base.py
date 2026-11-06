@@ -1058,6 +1058,7 @@ def delete_from_list(
             seen[asset.id] = asset
 
     dated = [entry for entry in entries if entry.timestamp is not None]
+    missing: List[DeleteEntry] = []  # dated entries the search by date did not find
     if dated:
         # Deleted photos are usually among the newest, so one request for the first page (the newest
         # ~100 assets) answers most lists. Only entries older than that page need the binary search.
@@ -1080,8 +1081,31 @@ def delete_from_list(
                 total = len(album)
             for asset in _assets_around(album, total, entry.timestamp, rank_dates, low=len(head)):
                 consider(asset)
+        missing = [
+            entry
+            for entry in dated
+            if not any(_entry_matches(entry, asset) for asset in seen.values())
+        ]
+
+    read_everything = False
     if len(dated) < len(entries):
         logger.info("Some entries have no date, scanning the whole iCloud library...")
+        read_everything = True
+    elif missing:
+        # The search by date assumes that iCloud lists the library newest first by capture date, and nothing
+        # guarantees that (a photo imported later with an old capture date may sit elsewhere). So an entry
+        # that is not found is looked for in the whole library before it is reported as missing.
+        logger.warning(
+            "%d of %d entries not found near their date (first: line %d, %s %d), "
+            "reading the whole iCloud library; it is not necessarily ordered by capture date",
+            len(missing),
+            len(dated),
+            missing[0].line,
+            missing[0].name,
+            missing[0].size,
+        )
+        read_everything = True
+    if read_everything:
         for scanned, asset in enumerate(album, start=1):
             consider(asset)
             if scanned % 2000 == 0:

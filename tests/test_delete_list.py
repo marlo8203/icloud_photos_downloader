@@ -218,6 +218,50 @@ class DeleteFromListTestCase(TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(real.call_count, 1)
 
+    def run_with_logger(self, library: FakeLibrary, content: str) -> tuple[int, mock.Mock, mock.Mock]:
+        logger = mock.Mock()
+        with (
+            mock.patch("icloudpd.base.delete_photo") as real,
+            mock.patch("icloudpd.base.delete_photo_dry_run"),
+        ):
+            status = delete_from_list(
+                logger, library, write_list(content), 50, False, lambda asset: asset.filename  # type: ignore[arg-type]
+            )
+        return status, real, logger
+
+    def test_asset_out_of_order_is_found_by_reading_the_whole_library(self) -> None:
+        # iCloud does not have to list the library newest first by capture date: this photo (taken at +10 h)
+        # sits in the middle of much newer ones, where neither the first page nor the search by date looks
+        library = make_library(300)
+        assets = library.all.assets
+        target = next(a for a in assets if a.id == "id10")
+        assets.remove(target)
+        assets.insert(150, target)
+        status, real, logger = self.run_with_logger(library, f"IMG_0010.HEIC\t1010\t{unix(10)}\n")
+        self.assertEqual(status, 0)
+        self.assertEqual([c.args[2].id for c in real.call_args_list], ["id10"])
+        fallbacks = [c for c in logger.warning.call_args_list if "reading the whole" in c.args[0]]
+        self.assertEqual(len(fallbacks), 1)
+
+    def test_no_fallback_when_the_date_search_finds_the_asset(self) -> None:
+        library = make_library(300)
+        status, real, logger = self.run_with_logger(library, f"IMG_0250.HEIC\t1250\t{unix(250)}\n")
+        self.assertEqual(status, 0)
+        self.assertEqual(real.call_count, 1)
+        self.assertFalse([c for c in logger.warning.call_args_list if "reading the whole" in c.args[0]])
+        self.assertLess(library.all.requests, 30)
+
+    def test_the_whole_library_is_read_once_for_several_missing_entries(self) -> None:
+        library = make_library(300)
+        content = f"NOPE_1.HEIC\t1\t{unix(10)}\nNOPE_2.HEIC\t2\t{unix(20)}\nIMG_0250.HEIC\t1250\t{unix(250)}\n"
+        status, real, logger = self.run_with_logger(library, content)
+        self.assertEqual(status, 0)
+        self.assertEqual([c.args[2].id for c in real.call_args_list], ["id250"])
+        fallbacks = [c for c in logger.warning.call_args_list if "reading the whole" in c.args[0]]
+        self.assertEqual(len(fallbacks), 1)  # one warning and one scan, for both missing entries
+        not_found = [c for c in logger.warning.call_args_list if c.args[0].startswith("Not found in iCloud")]
+        self.assertEqual(len(not_found), 2)
+
     def test_dry_run_does_not_delete(self) -> None:
         status, real, dry = self.run_delete(
             make_library(50), f"IMG_0010.HEIC\t1010\t{unix(10)}\n", dry_run=True

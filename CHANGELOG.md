@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- feature: `--delete-list FILE` (with `--delete-list-max`) deletes from iCloud the assets listed in a file, matched by original file name (also with the `name-id7` suffix) and size, and by date (within two minutes) when the line has one; recent assets are found with one request and older ones with a search by date
+- feature: `--delete-list FILE` (with `--delete-list-max`) deletes from iCloud the assets listed in a file, matched by original file name (also with the `name-id7` suffix) and size, and by date (within two minutes) when the line has one; recent assets are found with one request and older ones with a search by date, and an entry that is not found that way is looked for in the whole library before it is reported as missing
 - feature: `--webui-host` sets the address the web UI listens on, for example `127.0.0.1`
 - feature: the web UI server answers `GET /api/status` and `GET /api/activity` with JSON (state, progress, the files downloaded by the running process)
 - feature: [`menubar_app`](menubar_app/README.md), a macOS menu bar app (Photos Sync) around `icloudpd` that shows the sync state, imports downloads into Photos, and mirrors deletions made in Photos to iCloud and the disk
